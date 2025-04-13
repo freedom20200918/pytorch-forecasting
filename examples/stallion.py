@@ -1,3 +1,17 @@
+import os
+
+# 禁用 CUDA GPU（通常在 mac 上不影响，但保险起见）
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+# 禁用 MPS 后端（非常关键）
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
+
+# 强制使用 CPU 模式
+import torch
+if torch.backends.mps.is_available():
+    torch.backends.mps.is_available = lambda: False
+    torch.device("cpu")
+
 import pickle
 import warnings
 
@@ -5,7 +19,7 @@ import lightning.pytorch as pl
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
 from lightning.pytorch.loggers import TensorBoardLogger
 import numpy as np
-from pandas.core.common import SettingWithCopyWarning
+from pandas.errors import SettingWithCopyWarning
 
 from pytorch_forecasting import (
     GroupNormalizer,
@@ -113,11 +127,11 @@ early_stop_callback = EarlyStopping(
     monitor="val_loss", min_delta=1e-4, patience=10, verbose=False, mode="min"
 )
 lr_logger = LearningRateMonitor()
-logger = TensorBoardLogger(log_graph=True)
-
+# logger = TensorBoardLogger(log_graph=True)
+logger = TensorBoardLogger(save_dir="lightning_logs", log_graph=True)
 trainer = pl.Trainer(
     max_epochs=100,
-    accelerator="auto",
+    accelerator="cpu",
     gradient_clip_val=0.1,
     limit_train_batches=30,
     # val_check_interval=20,
