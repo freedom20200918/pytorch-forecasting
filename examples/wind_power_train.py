@@ -1,78 +1,132 @@
-# 文件名：wind_power_train.py
-
-import pandas as pd
+import os
+import warnings
 import numpy as np
+import pandas as pd
 import torch
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import EarlyStopping
-from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
-from pytorch_forecasting.data import NaNLabelEncoder
-from pytorch_forecasting.metrics import SMAPE
+import matplotlib.pyplot as plt
+from pandas.errors import SettingWithCopyWarning
 
-# 加载风电数据
+# ========== 禁用 GPU（适用于 Mac） ==========
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
+if torch.backends.mps.is_available():
+    torch.backends.mps.is_available = lambda: False
+
+# ========== PyTorch Forecasting ==========
+import lightning.pytorch as pl
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
+from lightning.pytorch.loggers import TensorBoardLogger
+from pytorch_forecasting import (
+    TimeSeriesDataSet,
+    TemporalFusionTransformer,
+    GroupNormalizer
+)
+from pytorch_forecasting.metrics import QuantileLoss
+from pytorch_forecasting.models.temporal_fusion_transformer.tuning import optimize_hyperparameters
+
+warnings.simplefilter("error", category=SettingWithCopyWarning)
+
+# ========== 加载风力数据 ==========
 df = pd.read_csv("data/wind_power.csv", parse_dates=["timestamp"])
 
+# 每15分钟为1个时间步
+df["time_idx"] = (df["timestamp"] - df["timestamp"].min()).dt.total_seconds() // (15 * 60)
+df["time_idx"] = df["time_idx"].astype(int)
 
-# 创建时间索引（以小时为单位）并转换为整数类型
-df["time_idx"] = ((df["timestamp"] - df["timestamp"].min()).dt.total_seconds() // 3600).astype(int)
-df["group"] = "wind_turbine_1"  # 简化为单个风机
+# 添加类别变量
+df["month"] = df["timestamp"].dt.month.astype("str").astype("category")
+df["wind_speed_log"] = np.log(df["wind_speed"] + 1e-8)
 
-# 加入 log_power 避免为零出错
-df["log_power"] = np.log(df["power"] + 1e-6)
+# ========== 定义模型参数 ==========
+max_encoder_length = 96  # 24小时历史数据
+max_prediction_length = 96  # 预测未来24小时（15分钟 × 96）
 
-# 设置训练/验证集分割点
-training_cutoff = df["time_idx"].max() - 24
-max_encoder_length = 24  # 使用过去 24 小时信息
-max_prediction_length = 6  # 预测未来 6 小时
+training_cutoff = df["time_idx"].max() - max_prediction_length
 
-# 构建训练数据集
+# ========== 构建 TimeSeries 数据集 ==========
 training = TimeSeriesDataSet(
-    df[df.time_idx <= training_cutoff],
+    df[lambda x: x.time_idx <= training_cutoff],
     time_idx="time_idx",
-    target="power",
-    group_ids=["group"],
+    target="power_output",
+    group_ids=["wind_farm", "turbine_id"],
     max_encoder_length=max_encoder_length,
     max_prediction_length=max_prediction_length,
-    time_varying_known_reals=["time_idx", "wind_speed", "wind_direction"],
-    time_varying_unknown_reals=["power", "log_power"],
-    target_normalizer=NaNLabelEncoder(),
+    static_categoricals=["wind_farm", "turbine_id"],
+    time_varying_known_reals=["time_idx", "wind_speed", "temperature"],
+    time_varying_unknown_reals=["power_output", "wind_speed_log"],
+    target_normalizer=GroupNormalizer(groups=["wind_farm", "turbine_id"]),
     add_relative_time_idx=True,
     add_target_scales=True,
     add_encoder_length=True,
 )
 
-# 验证数据集
 validation = TimeSeriesDataSet.from_dataset(training, df, predict=True, stop_randomization=True)
 
-# 加载器
-train_loader = training.to_dataloader(train=True, batch_size=64, num_workers=0)
-val_loader = validation.to_dataloader(train=False, batch_size=64, num_workers=0)
+# ========== 构建 DataLoader ==========
+train_dataloader = training.to_dataloader(train=True, batch_size=64, num_workers=0)
+val_dataloader = validation.to_dataloader(train=False, batch_size=64, num_workers=0)
 
-# 初始化 Temporal Fusion Transformer 模型
-tft = TemporalFusionTransformer.from_dataset(
-    training,
-    learning_rate=0.03,
-    hidden_size=16,
-    attention_head_size=1,
-    dropout=0.1,
-    hidden_continuous_size=8,
-    output_size=7,
-    loss=SMAPE(),
-    log_interval=10,
-    reduce_on_plateau_patience=4
+# ========== 回调设置 ==========
+early_stop_callback = EarlyStopping(monitor="val_loss", patience=10, mode="min")
+lr_logger = LearningRateMonitor()
+logger = TensorBoardLogger("lightning_logs", name="wind_power")
+
+# ========== 超参数优化（Optuna） ==========
+study = optimize_hyperparameters(
+    train_dataloader,
+    val_dataloader,
+    model_path="optuna_wind",
+    n_trials=30,
+    max_epochs=20,
+    gradient_clip_val_range=(0.01, 1.0),
+    hidden_size_range=(8, 64),
+    hidden_continuous_size_range=(8, 64),
+    attention_head_size_range=(1, 4),
+    learning_rate_range=(0.001, 0.1),
+    dropout_range=(0.1, 0.3),
+    trainer_kwargs=dict(
+        limit_train_batches=30,
+        log_every_n_steps=1,
+        enable_progress_bar=True,
+        accelerator="cpu"
+    ),
+    reduce_on_plateau_patience=4,
+    use_learning_rate_finder=False
 )
 
-# PyTorch Lightning 训练器
-trainer = Trainer(
-    max_epochs=30,
-    accelerator="cpu",
-    callbacks=[EarlyStopping(monitor="val_loss", patience=5)]
+# ========== 加载最佳模型并预测 ==========
+from pytorch_forecasting.models import TemporalFusionTransformer
+
+best_model_path = study.best_trial.user_attrs["best_model_path"]
+best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
+
+predictions, x = best_tft.predict(
+    val_dataloader,
+    mode="prediction",
+    return_x=True,
+    return_index=True
 )
 
-# 模型训练
-trainer.fit(tft, train_dataloaders=train_loader, val_dataloaders=val_loader)
+# ========== 输出预测结果 ==========
+pred_df = pd.DataFrame({
+    "time_idx": x["decoder_time_idx"][0].numpy(),
+    "timestamp": x["decoder_time"][0].numpy(),
+    "predicted_power": predictions[0].detach().numpy()
+})
 
-# 执行预测
-preds, index = tft.predict(val_loader, return_index=True)
-print("预测结果前 5 条：")
-print(preds[:5])
+pred_df["timestamp"] = pd.to_datetime(pred_df["timestamp"])
+pred_df.to_csv("predicted_24h_wind_power.csv", index=False)
+print("✅ 预测结果已保存到 predicted_24h_wind_power.csv")
+
+# ========== 可视化预测 ==========
+plt.figure(figsize=(12, 5))
+plt.plot(pred_df["timestamp"], pred_df["predicted_power"], marker="o", label="Predicted Power")
+plt.title("Predicted Wind Power Output - Next 24 Hours (15-min interval)")
+plt.xlabel("Time")
+plt.ylabel("Power Output (kW)")
+plt.xticks(rotation=45)
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.savefig("predicted_24h_wind_power.png")
+plt.show()
