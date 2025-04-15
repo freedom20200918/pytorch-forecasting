@@ -94,39 +94,18 @@ study = optimize_hyperparameters(
     use_learning_rate_finder=False
 )
 
-# ========== 加载最佳模型并预测 ==========
-from pytorch_forecasting.models import TemporalFusionTransformer
+# ✅ 保存 study 到文件
+import pickle
+with open("wind_power_study.pkl", "wb") as f:
+    pickle.dump(study, f)
+print("✅ 已保存调参 study 到 wind_power_study.pkl")
 
-best_model_path = study.best_trial.user_attrs["best_model_path"]
-best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
 
-predictions, x = best_tft.predict(
-    val_dataloader,
-    mode="prediction",
-    return_x=True,
-    return_index=True
-)
 
-# ========== 输出预测结果 ==========
-pred_df = pd.DataFrame({
-    "time_idx": x["decoder_time_idx"][0].numpy(),
-    "timestamp": x["decoder_time"][0].numpy(),
-    "predicted_power": predictions[0].detach().numpy()
-})
 
-pred_df["timestamp"] = pd.to_datetime(pred_df["timestamp"])
-pred_df.to_csv("predicted_24h_wind_power.csv", index=False)
-print("✅ 预测结果已保存到 predicted_24h_wind_power.csv")
 
-# ========== 可视化预测 ==========
-plt.figure(figsize=(12, 5))
-plt.plot(pred_df["timestamp"], pred_df["predicted_power"], marker="o", label="Predicted Power")
-plt.title("Predicted Wind Power Output - Next 24 Hours (15-min interval)")
-plt.xlabel("Time")
-plt.ylabel("Power Output (kW)")
-plt.xticks(rotation=45)
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.savefig("predicted_24h_wind_power.png")
-plt.show()
+
+
+
+
+
